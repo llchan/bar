@@ -11,6 +11,10 @@
 
 #include "config.h"
 
+#if XINERAMA
+#include <xcb/xinerama.h>
+#endif
+
 // Here be dragons
 
 #define MAX(a,b) ((a > b) ? a : b)
@@ -125,12 +129,13 @@ draw_char (int x, int align, wchar_t ch)
 }
 
 void
-parse (char *text)
+parse (char *text, int screen)
 {
     unsigned char *p = text;
 
     int pos_x = 0;
     int align = 0;
+    bool is_screen = true;
 
     xcb_fill_rect (clear_gc, 0, 0, bar_width, BAR_HEIGHT);
 
@@ -140,7 +145,7 @@ parse (char *text)
         if (*p == '\n')
             return;
 
-        if (*p == '\\' && p++ && *p != '\\' && strchr ("fbulcr", *p)) {
+        if (*p == '\\' && p++ && *p != '\\' && strchr ("fbuslcr", *p)) {
                 switch (*p++) {
                     case 'f': 
                         if (!isdigit (*p)) *p = '1'; 
@@ -153,6 +158,14 @@ parse (char *text)
                     case 'u': 
                         if (!isdigit (*p)) *p = '0'; 
                         xcb_set_ud ((*p++)-'0');
+                        break;
+                    case 's': 
+                        if (!isdigit (*p)) {
+                            ++p;
+                            is_screen = true;
+                        } else {
+                            is_screen = (screen < 0) || (((*p++) - '0') == screen);
+                        }
                         break;
 
                     case 'l': 
@@ -194,7 +207,9 @@ parse (char *text)
             else
                 xcb_set_fontset (FONT_MAIN);
 
-            pos_x += draw_char (pos_x, align, t);
+            if (is_screen) {
+                pos_x += draw_char (pos_x, align, t);
+            }
         }
     }
 }
@@ -307,10 +322,11 @@ set_ewmh_atoms (xcb_window_t root)
 }
 
 void
-init (void)
+init (int screen)
 {
     xcb_screen_t *scr;
     xcb_window_t root;
+    int x;
     int y;
 
     /* Connect to X */
@@ -325,8 +341,31 @@ init (void)
     root = scr->root;
 
     /* where to place the window */
+    x = BAR_OFFSET;
     y = (bar_bottom) ? (scr->height_in_pixels - BAR_HEIGHT) : 0;
     bar_width = (BAR_WIDTH < 0) ? (scr->width_in_pixels - BAR_OFFSET) : BAR_WIDTH;
+
+#if XINERAMA
+    if (screen >= 0) {
+        xcb_xinerama_screen_info_t* xinerama_scr = NULL;
+        xcb_xinerama_query_screens_cookie_t xinerama_query;
+        xcb_xinerama_screen_info_iterator_t iter;
+        xcb_generic_error_t* err = NULL;
+        xinerama_query = xcb_xinerama_query_screens_unchecked(c);
+        iter = xcb_xinerama_query_screens_screen_info_iterator(xcb_xinerama_query_screens_reply(c, xinerama_query, &err));
+        for (; iter.rem; --screen, xcb_xinerama_screen_info_next(&iter)) {
+            if (screen == 0) {
+                xinerama_scr = iter.data;
+                break;
+            }
+        }
+        if (xinerama_scr != NULL) {
+            y = (bar_bottom) ? (xinerama_scr->y_org + xinerama_scr->height - BAR_HEIGHT) : 0;
+            x = xinerama_scr->x_org + BAR_OFFSET;
+            bar_width = (BAR_WIDTH < 0) ? (xinerama_scr->width - BAR_OFFSET) : BAR_WIDTH;
+        }
+    }
+#endif
 
     /* Load the font */
     if (font_load ((const char* []){ BAR_FONT }))
@@ -334,7 +373,7 @@ init (void)
 
     /* Create the main window */
     win = xcb_generate_id (c);
-    xcb_create_window (c, XCB_COPY_FROM_PARENT, win, root, BAR_OFFSET, y, bar_width,
+    xcb_create_window (c, XCB_COPY_FROM_PARENT, win, root, x, y, bar_width,
             BAR_HEIGHT, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT, scr->root_visual,
             XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK, (const uint32_t []){ palette[0], XCB_EVENT_MASK_EXPOSURE });
 
@@ -361,7 +400,7 @@ init (void)
     /* Make the bar visible */
     xcb_map_window (c, win);
     /* Send a configure event. Needed to make bar work with Openbox */
-    xcb_configure_window (c, win, XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, (const uint32_t []){ BAR_OFFSET, y });
+    xcb_configure_window (c, win, XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, (const uint32_t []){ x, y });
 
     xcb_flush (c);
 }
@@ -410,25 +449,28 @@ main (int argc, char **argv)
     xcb_expose_event_t *expose_ev;
 
     int permanent = 0;
+    int screen = -1;
 
     char ch;
-    while ((ch = getopt (argc, argv, "phb")) != -1) {
+    while ((ch = getopt (argc, argv, "phbs:")) != -1) {
         switch (ch) {
             case 'h': 
                 printf ("usage: %s [-p | -h] [-b]\n"
                         "\t-h Show this help\n"
                         "\t-b Put bar at the bottom of the screen\n"
-                        "\t-p Don't close after the data ends\n", argv[0]); 
+                        "\t-p Don't close after the data ends\n"
+                        "\t-s Select screen to use\n", argv[0]); 
                 exit (0);
             case 'p': permanent = 1; break;
             case 'b': bar_bottom = 1; break;
+            case 's': screen = atoi(optarg); break;
         }
     }
 
     atexit (cleanup);
     signal (SIGINT, sighandle);
     signal (SIGTERM, sighandle);
-    init ();
+    init (screen);
 
     /* Get the fd to Xserver */
     pollin[1].fd = xcb_get_file_descriptor (c);
@@ -445,7 +487,7 @@ main (int argc, char **argv)
             }
             if (pollin[0].revents & POLLIN) { /* New input, process it */
                 fgets (input, sizeof(input), stdin);
-                parse (input);
+                parse (input, screen);
                 redraw = 1;
             }
             if (pollin[1].revents & POLLIN) { /* Xserver broadcasted an event */
